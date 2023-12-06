@@ -1,21 +1,28 @@
-import os
-import time
+import math
+
 import torch
-import torchvision
-from torch.utils.data import DataLoader
-from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
-from torchvision.transforms import RandomRotation, ColorJitter, ToPILImage, ToTensor
-from sklearn.metrics import precision_recall_fscore_support
+import os
+import numpy as np
 from bs4 import BeautifulSoup
 from PIL import Image
-import numpy as np
-import matplotlib.pyplot as plt
+import torchvision
 from matplotlib import patches
+from torchvision import transforms
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+import matplotlib.pyplot as plt
+from torchvision.transforms import RandomRotation
+from torchvision.transforms.functional import to_pil_image
+from sklearn.metrics import precision_recall_fscore_support
 
 # GPU 사용 가능 여부 확인
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+    print('GPU를 사용합니다:', torch.cuda.get_device_name(0))
+else:
+    print('사용 가능한 GPU가 없습니다. CPU를 사용합니다.')
+    device = torch.device("cpu")
 
-# XML 데이터에서 바운딩 박스 생성 함수
+# 객체의 bounding box 생성
 def generate_box(obj):
     xmin = float(obj.find('x_min').text)
     ymin = float(obj.find('y_min').text)
@@ -23,13 +30,23 @@ def generate_box(obj):
     ymax = float(obj.find('y_max').text)
     return [xmin, ymin, xmax, ymax]
 
-# XML 데이터에서 라벨 생성 함수
+# 객체의 라벨 생성
+adjust_label = 1
+default_label = 0
 def generate_label(obj):
-    state = obj.find('state').text
-    label_mapping = {"1": 0, "2": 1, "3": 2, "4": 3, "5": 4}
-    return label_mapping.get(state, 0)
+    if obj.find('state').text == "1":
+        return 0 + adjust_label
+    elif obj.find('state').text == "2":
+        return 1 + adjust_label
+    elif obj.find('state').text == "3":
+        return 2 + adjust_label
+    elif obj.find('state').text == "4":
+        return 3 + adjust_label
+    elif obj.find('state').text == "5":
+        return 4 + adjust_label
+    return default_label  # 기본 라벨 값 반환
 
-# XML 파일에서 타겟 생성 함수
+# XML 파일로부터 타겟 생성
 def generate_target(file):
     with open(file) as f:
         data = f.read()
@@ -42,7 +59,7 @@ def generate_target(file):
             print(f"{file}에 유효한 주석이 없습니다.")
             # 주석이 없는 경우 빈 바운딩 박스와 기본 라벨 반환
             boxes = torch.as_tensor([], dtype=torch.float32)
-            labels = torch.as_tensor([0], dtype=torch.int64)
+            labels = torch.as_tensor([default_label], dtype=torch.int64)
             target = {"boxes": boxes, "labels": labels}
             return target
 
@@ -62,7 +79,7 @@ def generate_target(file):
             print(f"{file}에 유효한 주석이 없습니다.")
             # 유효한 주석이 없는 경우 빈 바운딩 박스와 기본 라벨 반환
             boxes = torch.as_tensor([], dtype=torch.float32)
-            labels = torch.as_tensor([0], dtype=torch.int64)
+            labels = torch.as_tensor([default_label], dtype=torch.int64)
 
         boxes = torch.as_tensor(boxes, dtype=torch.float32)
         labels = torch.as_tensor(labels, dtype=torch.int64)
@@ -90,7 +107,7 @@ class EggDataset(object):
             print(f"인덱스 {idx}는 모든 주석이 무시되었으므로 건너뜁니다.")
             return None, None  # 이미지와 타겟 모두 None으로 반환
 
-        img = ToTensor()(img)
+        img = transforms.ToTensor()(img)
         target_boxes = target["boxes"]
         target_labels = target["labels"]
 
@@ -101,9 +118,9 @@ class EggDataset(object):
         return len(self.imgs)
 
 # 데이터 변환 정의
-data_transform = torchvision.transforms.Compose([
-    torchvision.transforms.Lambda(lambda x: {
-        'image': torchvision.transforms.functional.to_tensor(x['image']),
+data_transform = transforms.Compose([
+    transforms.Lambda(lambda x: {
+        'image': transforms.functional.to_tensor(x['image']),
         'boxes': x['boxes'],
         'labels': x['labels']
     } if x['boxes'].size(0) > 0 else {
@@ -112,7 +129,7 @@ data_transform = torchvision.transforms.Compose([
         'labels': torch.empty((0,), dtype=torch.int64),
     }),
     RandomRotation(degrees=(-45, 45), fill=(0,)),
-    torchvision.transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.5),
+    transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.5),
 ])
 
 # 모델 가중치 저장 디렉토리 생성
@@ -164,9 +181,9 @@ def evaluate_model(model, data_loader, device):
             predictions = model(imgs)
 
             for img, target, prediction in zip(imgs, targets, predictions):
-                img = ToPILImage()(img)
+                img = to_pil_image(img)
 
-                # NMS 적용 (평가 도중에 적용)
+                # NMS 적용
                 keep_indices = apply_nms(prediction['boxes'], prediction['scores'], iou_threshold=0.7)
 
                 # 예측된 바운딩 박스 중에서 라벨링 데이터와 일정 기준 이하로 차이 나는 것만 남기기
@@ -195,7 +212,7 @@ def evaluate_model(model, data_loader, device):
 
     return all_predictions, all_targets
 
-# 이미지에 라벨과 예측을 그림
+
 def plot_image_with_labels(img, annotation, predictions):
     img_np = np.array(img)
     annotation_cpu = {k: v.cpu().numpy() for k, v in annotation.items()}
@@ -260,11 +277,10 @@ def plot_image_with_labels(img, annotation, predictions):
         axes[1].text(xmin, ymin, f'Label: {pred_label}\nScore: {pred_score}', color='white', fontsize=8,
                      verticalalignment='top')
 
-    img_pil = ToPILImage()(img_np)
+    img_pil = transforms.ToPILImage()(img_np)
     plt.imshow(img_pil)
     plt.show()
 
-# NMS 적용 함수
 def apply_nms(boxes, scores, iou_threshold, score_threshold=0.1):
     # NumPy 배열을 torch.Tensor로 변환
     boxes = torch.tensor(boxes)
@@ -286,7 +302,9 @@ def apply_nms(boxes, scores, iou_threshold, score_threshold=0.1):
 
     return keep
 
-# 두 바운딩 박스 간의 차이 계산 함수
+
+
+# 두 바운딩 박스 간의 차이를 계산하는 함수
 def calculate_box_difference(box1, box2):
     return torch.abs(box1 - box2)
 
@@ -330,8 +348,10 @@ all_predictions, all_targets = evaluate_model(model, validation_data_loader, dev
 len_all_targets = len(all_targets)
 len_all_predictions = len(all_predictions)
 
+
 print(f"Length of all_targets: {len_all_targets}")
 print(f"Length of all_predictions: {len_all_predictions}")
+
 
 # 정밀도, 재현율, F1 점수 계산 및 출력
 precision, recall, f1, _ = precision_recall_fscore_support(all_targets, all_predictions, average='weighted')
